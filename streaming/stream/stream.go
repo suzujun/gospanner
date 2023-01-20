@@ -9,12 +9,13 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
+	"github.com/googleapis/gax-go/v2/apierror"
 	"golang.org/x/sync/semaphore"
 )
 
 type (
 	Client interface {
-		ListChangeRecords(ctx context.Context, params *ChangeRecordStreamParams) error
+		ListChangeRecords(ctx context.Context, params *ListChangeRecordsParams, opts ...Option) (err error)
 	}
 	client struct {
 		cli       *spanner.Client
@@ -27,6 +28,11 @@ type (
 	}
 )
 
+var (
+	ErrTimeoutOfReceiveCh = errors.New("stream: failed to timeout error of push change record")
+	ErrTimeoutOfQueueCh   = errors.New("stream: failed to timeout error of push queue")
+)
+
 func NewClient(params *Params) Client {
 	const maxLen = 10000
 	return &client{
@@ -37,12 +43,134 @@ func NewClient(params *Params) Client {
 	}
 }
 
+type ListChangeRecordsParams struct {
+	StreamName string    // required
+	StartAt    time.Time // required
+	EndAt      time.Time // 未指定 及び 未来日時指定するとリアルタイム監視となり処理が終了しない
+	Token      string
+	ReceiveCh  chan<- *DataChangeRecord // required
+}
+
+func (c *client) ListChangeRecords(ctx context.Context, params *ListChangeRecordsParams, opts ...Option) (err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	dopts := &options{
+		//nolint:gomnd
+		maxMailbox:      10000,
+		heartbeatMillis: 300000,
+		queuingTimeout:  time.Second * 5,
+		clientReceived:  func(stream, errmsg string) {},
+		clientQueued:    func(stream, errmsg string) {},
+		clientStarted:   func(stream string) {},
+		clientCompleted: func(stream, errmsg string, duration int64) {},
+	}
+	for _, opt := range opts {
+		opt(dopts)
+	}
+	queueCh := make(chan *fetchParams, dopts.maxMailbox)
+	queueCh <- &fetchParams{
+		startAt:         params.StartAt,
+		endAt:           params.EndAt,
+		token:           params.Token,
+		heartbeatMillis: dopts.heartbeatMillis,
+		level:           1,
+	}
+	manage := &manageParams{
+		stream:    params.StreamName,
+		receiveCh: params.ReceiveCh,
+		queueCh:   queueCh,
+		tokens:    make(map[string]struct{}),
+		opts:      dopts,
+	}
+	var total int64
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if atomic.LoadInt64(&total) == 0 {
+					close(queueCh)
+				}
+			}
+		}
+	}()
+	const concurrency = 5
+	sem := semaphore.NewWeighted(concurrency)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case queue, ok := <-queueCh:
+			if !ok {
+				return nil
+			}
+			atomic.AddInt64(&total, 1)
+			if err := sem.Acquire(ctx, 1); err != nil {
+				atomic.AddInt64(&total, -1)
+				return err
+			}
+			go func() {
+				defer func() {
+					sem.Release(1)
+					atomic.AddInt64(&total, -1)
+				}()
+				err = c.fetch(ctx, manage, queue)
+				if err != nil {
+					cancel()
+				}
+			}()
+		}
+	}
+}
+
 type manageParams struct {
 	stream     string
 	queueCh    chan<- *fetchParams
 	receiveCh  chan<- *DataChangeRecord
 	tokens     map[string]struct{}
 	tokenMutex sync.RWMutex
+	opts       *options
+}
+
+func (p *manageParams) PushResult(ctx context.Context, record *DataChangeRecord) error {
+	var code string
+	defer func() {
+		p.opts.clientReceived(p.stream, code)
+	}()
+	timer := time.NewTimer(p.opts.queuingTimeout)
+	select {
+	case p.receiveCh <- record:
+		code = "OK"
+		return nil
+	case <-ctx.Done():
+		code = "ContextDone"
+		return ctx.Err()
+	case <-timer.C:
+		code = "Timeout"
+		return ErrTimeoutOfReceiveCh
+	}
+}
+
+func (p *manageParams) PushQueue(ctx context.Context, queue *fetchParams) error {
+	var code string
+	defer func() {
+		p.opts.clientQueued(p.stream, code)
+	}()
+	timer := time.NewTimer(p.opts.queuingTimeout)
+	select {
+	case p.queueCh <- queue:
+		code = "OK"
+		return nil
+	case <-ctx.Done():
+		code = "ContextDone"
+		return ctx.Err()
+	case <-timer.C:
+		code = "Timeout"
+		return ErrTimeoutOfQueueCh
+	}
 }
 
 func (p *manageParams) contains(token string) bool {
@@ -58,176 +186,88 @@ func (p *manageParams) contains(token string) bool {
 	return false
 }
 
-type ChangeRecordStreamParams struct {
-	StreamName      string    // required
-	StartAt         time.Time // required
-	EndAt           *time.Time
-	Token           *string
-	HeartbeatMillis int64                    // required
-	ReceiveCh       chan<- *DataChangeRecord // required
-}
-
-func (c *client) ListChangeRecords(ctx context.Context, params *ChangeRecordStreamParams) (err error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	const maxLen = 10000
-	var wg sync.WaitGroup
-	queueCh := make(chan *fetchParams, maxLen)
-	queueCh <- &fetchParams{
-		startAt:         params.StartAt,
-		endAt:           params.EndAt,
-		token:           params.Token,
-		heartbeatMillis: params.HeartbeatMillis,
-		level:           1,
-	}
-	manage := &manageParams{
-		stream:    params.StreamName,
-		receiveCh: params.ReceiveCh,
-		queueCh:   queueCh,
-		tokens:    make(map[string]struct{}),
-	}
-	var total int64
-	go func() {
-		// debug 用途
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				fmt.Printf("ticker: total=%d, queue=%d, receive=%d\n", atomic.LoadInt64(&total), len(manage.queueCh), len(manage.receiveCh))
-			}
-		}
-	}()
-	const concurrency = 5
-	sem := semaphore.NewWeighted(concurrency)
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case queue, ok := <-queueCh:
-			if !ok {
-				wg.Wait()
-				return nil
-			}
-			if err := sem.Acquire(ctx, 1); err != nil {
-				return err
-			}
-			wg.Add(1)
-			atomic.AddInt64(&total, 1)
-			go func() {
-				defer func() {
-					atomic.AddInt64(&total, 1)
-					wg.Done()
-					sem.Release(1)
-				}()
-				err = c.fetch(ctx, manage, queue)
-				if err != nil {
-					close(queueCh)
-				}
-			}()
-		}
-	}
-}
-
 type fetchParams struct {
 	startAt         time.Time
-	endAt           *time.Time
-	token           *string
+	endAt           time.Time
+	token           string
 	heartbeatMillis int64
 	level           int
 }
 
-func (c *client) fetch(ctx context.Context, manage *manageParams, queue *fetchParams) error {
+func (p *fetchParams) endAtPtr() *time.Time {
+	if p.endAt.IsZero() {
+		return nil
+	}
+	return &p.endAt
+}
+
+func (p *fetchParams) tokenPtr() *string {
+	if len(p.token) == 0 {
+		return nil
+	}
+	return &p.token
+}
+
+func (p *fetchParams) newStatement(stream string) spanner.Statement {
 	const baseSQL = `SELECT ChangeRecord FROM READ_%s(
-	start_timestamp => @startTimestamp,
-	end_timestamp => @endTimestamp,
-	partition_token => @partitionToken,
-	heartbeat_milliseconds => @heartbeatMillis
-)`
-	status := "start"
-	start := time.Now()
-	go func() {
-		// debug 用途
-		timer := time.NewTicker(time.Second)
-		defer timer.Stop()
-		for {
-			select {
-			case <-timer.C:
-				if status == "done" {
-					return
-				}
-				duration := time.Since(start).Truncate(time.Second).String()
-				fmt.Printf("wait done of fetch: %s: %s: %+v\n", status, duration, queue)
-			}
-		}
-	}()
-	defer func() {
-		status = "done"
-	}()
-	stmt := spanner.NewStatement(fmt.Sprintf(baseSQL, manage.stream))
+		start_timestamp => @startTimestamp,
+		end_timestamp => @endTimestamp,
+		partition_token => @partitionToken,
+		heartbeat_milliseconds => @heartbeatMillis
+	)`
+	stmt := spanner.NewStatement(fmt.Sprintf(baseSQL, stream))
 	stmt.Params = map[string]interface{}{
 		// @see https://cloud.google.com/spanner/docs/change-streams/details?hl=ja#change_stream_query_syntax
-		"startTimestamp":  queue.startAt, // required
-		"endTimestamp":    queue.endAt,
-		"partitionToken":  queue.token,
-		"heartbeatMillis": int64(300000), // required
+		"startTimestamp":  p.startAt, // required
+		"endTimestamp":    p.endAtPtr(),
+		"partitionToken":  p.tokenPtr(),
+		"heartbeatMillis": p.heartbeatMillis, // required
 	}
+	return stmt
+}
+
+func (c *client) fetch(ctx context.Context, manage *manageParams, queue *fetchParams) (err error) {
+	start := time.Now()
+	manage.opts.clientStarted(manage.stream)
+	defer func() {
+		var code string
+		var aerr *apierror.APIError
+		if errors.As(err, &aerr) {
+			code = aerr.GRPCStatus().Code().String()
+		}
+		duration := time.Since(start).Milliseconds()
+		manage.opts.clientCompleted(manage.stream, code, duration)
+	}()
+
+	stmt := queue.newStatement(manage.stream)
 	iter := c.cli.Single().Query(ctx, stmt)
-	status = "iter"
-	var total int
-	err := iter.Do(func(row *spanner.Row) error {
-		total++
-		defer func() {
-			status = fmt.Sprintf("iter:do[%d]:fin2", total)
-		}()
-		status = fmt.Sprintf("iter:do[%d]", total)
+	err = iter.Do(func(row *spanner.Row) error {
 		records := []*ChangeRecord{}
 		if err := row.Columns(&records); err != nil {
 			return err
 		}
-		status = fmt.Sprintf("iter:do[%d]:columns", total)
-		for i, record := range records {
-			status = fmt.Sprintf("iter:do[%d]:Records[%d]:DataChangeRecords", total, i)
-			for j, changeRecord := range record.DataChangeRecords {
-				status = fmt.Sprintf("iter:do[%d]:DataChangeRecords[%d][%d]", total, i, j)
-				manage.receiveCh <- changeRecord
-				timer := time.NewTimer(time.Second * 5)
-				select {
-				case manage.receiveCh <- changeRecord:
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-timer.C:
-					return errors.New("stream: failed to timeout error of push change record")
+		for _, record := range records {
+			for _, changeRecord := range record.DataChangeRecords {
+				if err := manage.PushResult(ctx, changeRecord); err != nil {
+					return err
 				}
 			}
-			status = fmt.Sprintf("iter:do[%d]:Records[%d]:ChildPartitionsRecords", total, i)
-			for j, patitionsRecord := range record.ChildPartitionsRecords {
-				for k, partition := range patitionsRecord.ChildPartitions {
-					status = fmt.Sprintf("iter:do[%d]:ChildPartitionsRecords[%d][%d][%d]", total, i, j, k)
+			for _, patitionsRecord := range record.ChildPartitionsRecords {
+				for _, partition := range patitionsRecord.ChildPartitions {
 					if manage.contains(partition.Token) {
 						continue
 					}
 					queue := *queue // copy
 					queue.startAt = patitionsRecord.StartTimestamp
-					queue.token = &partition.Token
+					queue.token = partition.Token
 					queue.level++
-					timer := time.NewTimer(time.Second * 5)
-					select {
-					case manage.queueCh <- &queue:
-					case <-ctx.Done():
-						return ctx.Err()
-					case <-timer.C:
-						return errors.New("stream: failed to timeout error of push queue")
+					if err := manage.PushQueue(ctx, &queue); err != nil {
+						return err
 					}
 				}
 			}
-			status = fmt.Sprintf("iter:do[%d]:Records[%d]:fin", total, i)
 		}
-		status = fmt.Sprintf("iter:do[%d]:fin", total)
 		return nil
 	})
-	status = fmt.Sprintf("last")
 	return err
 }

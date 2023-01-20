@@ -7,25 +7,56 @@ import (
 )
 
 type ChangeRecord struct {
-	DataChangeRecords      []*DataChangeRecord      `spanner:"data_change_record"`
+	DataChangeRecords      DataChangeRecords        `spanner:"data_change_record"`
 	HeartbeatRecords       []*HeartbeatRecord       `spanner:"heartbeat_record"`
 	ChildPartitionsRecords []*ChildPartitionsRecord `spanner:"child_partitions_record"`
 }
 
+type DataChangeRecords []*DataChangeRecord
+
 type DataChangeRecord struct {
-	CommitTimestamp                      time.Time     `spanner:"commit_timestamp"`
-	RecordSequence                       string        `spanner:"record_sequence"`
-	ServerTransactionID                  string        `spanner:"server_transaction_id"`
-	IsLastRecordInTransactionInPartition bool          `spanner:"is_last_record_in_transaction_in_partition"`
-	TableName                            string        `spanner:"table_name"`
-	ColumnTypes                          []*ColumnType `spanner:"column_types"`
-	Mods                                 []*Mod        `spanner:"mods"`
-	ModType                              string        `spanner:"mod_type"`
-	ValueCaptureType                     string        `spanner:"value_capture_type"`
-	NumberOfRecordsInTransaction         int64         `spanner:"number_of_records_in_transaction"`
-	NumberOfPartitionsInTransaction      int64         `spanner:"number_of_partitions_in_transaction"`
-	TransactionTag                       string        `spanner:"transaction_tag"`
-	IsSystemTransaction                  bool          `spanner:"is_system_transaction"`
+	CommitTimestamp                      time.Time   `spanner:"commit_timestamp"`
+	RecordSequence                       string      `spanner:"record_sequence"`
+	ServerTransactionID                  string      `spanner:"server_transaction_id"`
+	IsLastRecordInTransactionInPartition bool        `spanner:"is_last_record_in_transaction_in_partition"`
+	TableName                            string      `spanner:"table_name"`
+	ColumnTypes                          ColumnTypes `spanner:"column_types"`
+	Mods                                 []*Mod      `spanner:"mods"`
+	ModType                              string      `spanner:"mod_type"`
+	ValueCaptureType                     string      `spanner:"value_capture_type"`
+	NumberOfRecordsInTransaction         int64       `spanner:"number_of_records_in_transaction"`
+	NumberOfPartitionsInTransaction      int64       `spanner:"number_of_partitions_in_transaction"`
+	TransactionTag                       string      `spanner:"transaction_tag"`
+	IsSystemTransaction                  bool        `spanner:"is_system_transaction"`
+}
+
+func (r *DataChangeRecord) PrimaryKeySets() spanner.KeySet {
+	primaryKeys := r.ColumnTypes.PrimaryKeys()
+	keys := make([]spanner.KeySet, len(r.Mods))
+	for i, mod := range r.Mods {
+		kvs, ok := mod.Keys.Value.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		pks := make(spanner.Key, len(primaryKeys))
+		for i, key := range primaryKeys {
+			pks[i] = kvs[key]
+		}
+		keys[i] = pks
+	}
+	return spanner.KeySets(keys...)
+}
+
+type ColumnTypes []*ColumnType
+
+func (ts ColumnTypes) PrimaryKeys() []string {
+	pks := make([]string, 0, 1)
+	for _, column := range ts {
+		if column.IsPrimaryKey {
+			pks = append(pks, column.Name)
+		}
+	}
+	return pks
 }
 
 type ColumnType struct {
